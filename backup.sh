@@ -1,0 +1,824 @@
+#!/bin/bash
+set -euo pipefail
+
+# ============================================
+# Sauvegarde et restauration des applications VPS
+#
+# Usage : bash backup.sh
+# ============================================
+
+# --- Couleurs ---
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+info()    { echo -e "${BLUE}[INFO] $1${NC}"; }
+success() { echo -e "${GREEN}[OK] $1${NC}"; }
+warn()    { echo -e "${YELLOW}[WARN] $1${NC}"; }
+err()     { echo -e "${RED}[ERR] $1${NC}"; }
+
+# Echapper les caracteres speciaux pour sed
+# Echappe : \ (escape), & (back-reference), | (delimiteur)
+sed_escape() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\&/g' -e 's/|/\\|/g'
+}
+
+# Fichiers temporaires a nettoyer au EXIT
+_CLEANUP_FILES=()
+cleanup() { rm -f "${_CLEANUP_FILES[@]}"; }
+trap cleanup EXIT
+
+# Lire une variable depuis un fichier key="value" de facon securisee
+read_state_var() {
+    local file="$1" var="$2"
+    grep "^${var}=" "$file" 2>/dev/null | head -1 | cut -d'=' -f2- | sed 's/^"//;s/"$//'
+}
+
+# =========================================
+# DETECTION OS LOCAL
+# =========================================
+
+detect_os() {
+    case "$(uname -s)" in
+        Darwin)  OS="mac" ;;
+        Linux)
+            if grep -qi microsoft /proc/version 2>/dev/null; then
+                OS="wsl"
+            else
+                OS="linux"
+            fi
+            ;;
+        MINGW*|MSYS*|CYGWIN*)  OS="windows" ;;
+        *)  OS="unknown" ;;
+    esac
+}
+
+detect_os
+
+# --- Chargement de la langue ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [ -f "${SCRIPT_DIR}/lang.sh" ]; then
+    . "${SCRIPT_DIR}/lang.sh"
+else
+    _LANG_TMP=$(mktemp)
+    _CLEANUP_FILES+=("$_LANG_TMP")
+    # shellcheck disable=SC1090
+    curl -fsSL "https://raw.githubusercontent.com/mariusdjen/vpskit/main/lang.sh" -o "$_LANG_TMP" 2>/dev/null && . "$_LANG_TMP"
+fi
+
+VPS_IP=""
+SSH_KEY=""
+USERNAME=""
+APP_NAME=""
+DEST_DIR="."
+SAVE_MODE="local"
+RESTORE=false
+RESTORE_FILE=""
+
+# =========================================
+# MODE INTERACTIF
+# =========================================
+
+    echo ""
+    echo "========================================="
+    echo -e "  ${BOLD}VPS BACKUP${NC}"
+    echo "  $MSG_BACKUP_HEADER"
+    echo "========================================="
+    echo ""
+
+    SSH_DIR="$HOME/.ssh"
+    LOCAL_STATE="$SSH_DIR/.vps-bootstrap-local"
+
+    if [ -f "$LOCAL_STATE" ]; then
+        VPS_IP=$(read_state_var "$LOCAL_STATE" "VPS_IP")
+        SSH_KEY=$(read_state_var "$LOCAL_STATE" "SSH_KEY")
+        USERNAME=$(read_state_var "$LOCAL_STATE" "USERNAME")
+        success "$MSG_BACKUP_SESSION_FOUND"
+        echo ""
+        echo "    $(printf "$MSG_BACKUP_SESSION_IP" "$VPS_IP")"
+        echo "    $(printf "$MSG_BACKUP_SESSION_KEY" "$(basename "$SSH_KEY")")"
+        echo "    $(printf "$MSG_BACKUP_SESSION_USER" "$USERNAME")"
+        echo ""
+        read -p "  $MSG_BACKUP_SESSION_CONFIRM" USE_SESSION
+        if [[ ! "$USE_SESSION" =~ ^[$LANG_YES_CHARS]$ ]]; then
+            VPS_IP=""
+            SSH_KEY=""
+            USERNAME=""
+        fi
+    else
+        info "$MSG_BACKUP_NO_SESSION"
+        echo "$MSG_BACKUP_RUN_SETUP"
+        echo ""
+    fi
+
+    if [ -z "$VPS_IP" ]; then
+        read -p "$MSG_BACKUP_PROMPT_IP" VPS_IP
+    fi
+    if [ -z "$SSH_KEY" ]; then
+        read -p "$MSG_BACKUP_PROMPT_KEY" SSH_KEY
+    fi
+    if [ -z "$USERNAME" ]; then
+        read -p "$MSG_BACKUP_PROMPT_USER" USERNAME
+        USERNAME=${USERNAME:-deploy}
+    fi
+
+    echo ""
+
+    # Choix : sauvegarder, restaurer ou configurer S3
+    echo -e "${BOLD}${YELLOW}$MSG_BACKUP_ACTION_PROMPT${NC}"
+    echo ""
+    echo "$MSG_BACKUP_ACTION_SAVE"
+    echo "$MSG_BACKUP_ACTION_RESTORE"
+    # Detecter si S3 est configure pour afficher le label adapte
+    s3_config_file="$SSH_DIR/.vpskit-s3"
+    if [ -f "$s3_config_file" ]; then
+        s3_bkt=""
+        s3_bkt=$(read_state_var "$s3_config_file" "S3_BUCKET")
+        if [ -n "$s3_bkt" ]; then
+            echo "    3) $(printf "$MSG_BACKUP_MENU_S3_CONFIGURED" "$s3_bkt")"
+        else
+            echo "    3) $MSG_BACKUP_MENU_S3_NOT_CONFIGURED"
+        fi
+    else
+        echo "    3) $MSG_BACKUP_MENU_S3_NOT_CONFIGURED"
+    fi
+    echo "    4) $MSG_BACKUP_MENU_BACK"
+    echo ""
+    read -p "$MSG_BACKUP_ACTION_CHOICE" BACKUP_CHOICE
+    echo ""
+
+    if [ "$BACKUP_CHOICE" = "3" ]; then
+        if [ -f "${SCRIPT_DIR}/settings.sh" ]; then
+            bash "${SCRIPT_DIR}/settings.sh" --remote-backup
+        else
+            _settings_tmp=$(mktemp)
+            _CLEANUP_FILES+=("$_settings_tmp")
+            if curl -fsSL "https://raw.githubusercontent.com/mariusdjen/vpskit/main/settings.sh" -o "$_settings_tmp" 2>/dev/null; then
+                bash "$_settings_tmp" --remote-backup
+            else
+                err "$MSG_BACKUP_ERR_SETTINGS_DOWNLOAD"
+            fi
+            rm -f "$_settings_tmp"
+        fi
+        exit 0
+    elif [ "$BACKUP_CHOICE" = "4" ]; then
+        exit 0
+    elif [ "$BACKUP_CHOICE" = "2" ]; then
+        RESTORE=true
+
+        # Demander le fichier de sauvegarde
+        echo "$MSG_BACKUP_RESTORE_HINT_1"
+        echo "$MSG_BACKUP_RESTORE_HINT_2"
+        echo ""
+        read -p "$MSG_BACKUP_RESTORE_PROMPT_FILE" RESTORE_FILE
+        RESTORE_FILE=$(echo "$RESTORE_FILE" | sed "s|^['\"]||;s|['\"]$||;s|^~|$HOME|;s|\\\\ | |g;s|[[:space:]]*$||")
+
+        if [ ! -f "$RESTORE_FILE" ]; then
+            err "$(printf "$MSG_BACKUP_ERR_FILE_NOT_FOUND" "$RESTORE_FILE")"
+            exit 1
+        fi
+
+        # Demander le nom de l'app
+        read -p "$MSG_BACKUP_RESTORE_PROMPT_APP" APP_NAME
+    else
+        # Lister les apps et proposer le choix
+        info "$MSG_BACKUP_FETCHING_APPS"
+        APPS_LIST=$(ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes "${USERNAME}@${VPS_IP}" "ls -1 ~/apps/ 2>/dev/null" || true)
+
+        if [ -z "$APPS_LIST" ]; then
+            err "$MSG_BACKUP_ERR_NO_APPS"
+            exit 1
+        fi
+
+        echo ""
+        echo "$MSG_BACKUP_APPS_DEPLOYED"
+        echo ""
+        INDEX=1
+        while IFS= read -r app; do
+            echo "    $INDEX) $app"
+            INDEX=$((INDEX + 1))
+        done <<< "$APPS_LIST"
+        echo ""
+        echo "$(printf "$MSG_BACKUP_APP_ALL" "$INDEX")"
+        echo ""
+        read -p "$MSG_BACKUP_PROMPT_APP_CHOICE" APP_CHOICE
+
+        if ! [[ "$APP_CHOICE" =~ ^[0-9]+$ ]]; then
+            err "$MSG_BACKUP_ERR_INVALID_CHOICE"
+            exit 1
+        fi
+
+        if [ "$APP_CHOICE" = "$INDEX" ]; then
+            APP_NAME=""
+        else
+            APP_NAME=$(echo "$APPS_LIST" | sed -n "${APP_CHOICE}p")
+            if [ -z "$APP_NAME" ]; then
+                err "$MSG_BACKUP_ERR_INVALID_CHOICE_SIMPLE"
+                exit 1
+            fi
+        fi
+
+        # Choix de la destination : local, cloud ou les deux
+        SAVE_MODE="local"
+        if [ -f "$s3_config_file" ] && [ -n "$s3_bkt" ]; then
+            echo ""
+            echo -e "${BOLD}${YELLOW}$MSG_BACKUP_SAVE_WHERE${NC}"
+            echo ""
+            echo "$MSG_BACKUP_SAVE_LOCAL"
+            echo "$MSG_BACKUP_SAVE_CLOUD"
+            echo "$MSG_BACKUP_SAVE_BOTH"
+            echo ""
+            read -p "$MSG_BACKUP_SAVE_CHOICE" SAVE_CHOICE
+            case "$SAVE_CHOICE" in
+                2) SAVE_MODE="cloud" ;;
+                3) SAVE_MODE="both" ;;
+                *) SAVE_MODE="local" ;;
+            esac
+        fi
+
+        # Dossier de destination (sauf si cloud uniquement)
+        if [ "$SAVE_MODE" != "cloud" ]; then
+            echo ""
+            read -p "$MSG_BACKUP_PROMPT_DEST" DEST_INPUT
+            DEST_DIR=${DEST_INPUT:-.}
+        fi
+    fi
+
+# Verifier que le dossier est accessible en ecriture
+if [ ! -w "$DEST_DIR" ]; then
+    DEST_DIR="$HOME/Downloads"
+    mkdir -p "$DEST_DIR"
+    warn "$(printf "$MSG_BACKUP_DEST_FALLBACK" "$DEST_DIR")"
+fi
+
+# =========================================
+# VALIDATION
+# =========================================
+
+ERRORS=0
+
+if [ -z "$VPS_IP" ]; then
+    err "$MSG_BACKUP_ERR_IP_REQUIRED"
+    ERRORS=$((ERRORS + 1))
+fi
+if [ -z "$SSH_KEY" ] || [ ! -f "$SSH_KEY" ]; then
+    err "$(printf "$MSG_BACKUP_ERR_KEY_NOT_FOUND" "${SSH_KEY:-$MSG_BACKUP_FALLBACK_UNSPECIFIED}")"
+    ERRORS=$((ERRORS + 1))
+fi
+if [ -z "$USERNAME" ]; then
+    err "$MSG_BACKUP_ERR_USER_REQUIRED"
+    ERRORS=$((ERRORS + 1))
+fi
+if [ "$RESTORE" = true ]; then
+    if [ -z "$APP_NAME" ]; then
+        err "$MSG_BACKUP_ERR_APP_REQUIRED_RESTORE"
+        ERRORS=$((ERRORS + 1))
+    fi
+    if [ -z "$RESTORE_FILE" ] || [ ! -f "$RESTORE_FILE" ]; then
+        err "$(printf "$MSG_BACKUP_ERR_RESTORE_FILE_NOT_FOUND" "${RESTORE_FILE:-non specifie}")"
+        ERRORS=$((ERRORS + 1))
+    fi
+fi
+
+if [ "$ERRORS" -gt 0 ]; then
+    exit 1
+fi
+
+# --- Validation IP ---
+if ! echo "$VPS_IP" | grep -qE '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'; then
+    err "$(printf "$MSG_BACKUP_ERR_IP_INVALID" "$VPS_IP")"
+    echo "$MSG_BACKUP_ERR_IP_FORMAT"
+    exit 1
+fi
+
+# --- Test connexion SSH ---
+info "$MSG_BACKUP_CONNECTING"
+if ! ssh -i "$SSH_KEY" -o ConnectTimeout=10 -o BatchMode=yes "${USERNAME}@${VPS_IP}" "echo ok" &>/dev/null; then
+    err "$(printf "$MSG_BACKUP_ERR_CONNECT" "$USERNAME" "$VPS_IP")"
+    echo ""
+    echo "$MSG_BACKUP_ERR_CONNECT_HINT"
+    exit 1
+fi
+success "$MSG_BACKUP_SSH_OK"
+
+# =========================================
+# MODE RESTAURATION
+# =========================================
+
+if [ "$RESTORE" = true ]; then
+    info "$MSG_BACKUP_RESTORE_SENDING_FILE"
+    scp -i "$SSH_KEY" "$RESTORE_FILE" "${USERNAME}@${VPS_IP}:/tmp/vps-restore.tar.gz"
+    success "$MSG_BACKUP_RESTORE_FILE_SENT"
+
+    TMPSCRIPT=$(mktemp)
+    _CLEANUP_FILES+=("$TMPSCRIPT")
+    cat > "$TMPSCRIPT" << 'RESTORE_EOF'
+#!/bin/bash
+set -euo pipefail
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+APP_NAME="__APP_NAME__"
+USERNAME="__USERNAME__"
+APP_DIR="/home/$USERNAME/apps/$APP_NAME"
+RESTORE_TMP="/tmp/vps-restore-work"
+
+info()    { echo -e "${BLUE}[INFO] $1${NC}"; }
+success() { echo -e "${GREEN}[OK] $1${NC}"; }
+warn()    { echo -e "${YELLOW}[WARN] $1${NC}"; }
+err()     { echo -e "${RED}[ERR] $1${NC}"; }
+
+echo ""
+echo "========================================="
+echo -e "  ${BOLD}$(printf "$RMSG_RESTORE_HEADER" "$APP_NAME")${NC}"
+echo "========================================="
+echo ""
+
+# Extraire l'archive
+rm -rf "$RESTORE_TMP"
+mkdir -p "$RESTORE_TMP"
+tar xzf /tmp/vps-restore.tar.gz -C "$RESTORE_TMP"
+rm -f /tmp/vps-restore.tar.gz
+
+# Creer le dossier de l'app si necessaire
+mkdir -p "$APP_DIR"
+
+# Restaurer le fichier .env
+if [ -f "$RESTORE_TMP/env" ]; then
+    cp "$RESTORE_TMP/env" "$APP_DIR/.env"
+    chown "$USERNAME:$USERNAME" "$APP_DIR/.env"
+    chmod 600 "$APP_DIR/.env"
+    success "$RMSG_RESTORE_ENV_OK"
+fi
+
+# Restaurer les metadonnees
+if [ -f "$RESTORE_TMP/deploy-domain" ]; then
+    cp "$RESTORE_TMP/deploy-domain" "$APP_DIR/.deploy-domain"
+    chown "$USERNAME:$USERNAME" "$APP_DIR/.deploy-domain"
+fi
+if [ -f "$RESTORE_TMP/deploy-port" ]; then
+    cp "$RESTORE_TMP/deploy-port" "$APP_DIR/.deploy-port"
+    chown "$USERNAME:$USERNAME" "$APP_DIR/.deploy-port"
+fi
+
+# Restaurer le Caddyfile
+if [ -f "$RESTORE_TMP/Caddyfile" ]; then
+    cp "$RESTORE_TMP/Caddyfile" /etc/caddy/Caddyfile
+    if command -v caddy &>/dev/null; then
+        if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null; then
+            systemctl reload caddy 2>/dev/null || true
+            success "$RMSG_RESTORE_CADDYFILE_OK"
+        else
+            warn "$RMSG_RESTORE_CADDYFILE_WARN"
+        fi
+    else
+        success "$RMSG_RESTORE_CADDYFILE_NO_CADDY"
+    fi
+fi
+
+# Restaurer les volumes Docker
+for VOL_ARCHIVE in "$RESTORE_TMP"/volume-*.tar.gz; do
+    [ -f "$VOL_ARCHIVE" ] || continue
+    VOL_NAME=$(basename "$VOL_ARCHIVE" .tar.gz | sed 's/^volume-//')
+    info "$(printf "$RMSG_RESTORE_VOLUME_RESTORING" "$VOL_NAME")"
+
+    # Creer le volume s'il n'existe pas
+    docker volume create "$VOL_NAME" 2>/dev/null || true
+
+    # Restaurer les donnees
+    docker run --rm -v "$VOL_NAME":/data -v "$RESTORE_TMP":/backup alpine sh -c "cd /data && tar xzf /backup/$(basename "$VOL_ARCHIVE") --strip-components=1 2>/dev/null || tar xzf /backup/$(basename "$VOL_ARCHIVE") 2>/dev/null"
+    success "$(printf "$RMSG_RESTORE_VOLUME_OK" "$VOL_NAME")"
+done
+
+# Relancer les conteneurs si possible
+if [ -d "$APP_DIR" ]; then
+    cd "$APP_DIR"
+    COMPOSE_FILE=""
+    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+        if [ -f "$APP_DIR/$f" ]; then
+            COMPOSE_FILE="$f"
+            break
+        fi
+    done
+
+    if [ -n "$COMPOSE_FILE" ]; then
+        info "$RMSG_RESTORE_APP_STARTING"
+        sudo -u "$USERNAME" docker compose up -d --build 2>&1 || true
+        success "$RMSG_RESTORE_APP_STARTED"
+    fi
+fi
+
+# Nettoyage
+rm -rf "$RESTORE_TMP"
+
+echo ""
+echo "========================================="
+echo -e "  ${GREEN}$RMSG_RESTORE_DONE${NC}"
+echo "========================================="
+echo ""
+echo "$(printf "$RMSG_RESTORE_DONE_APP" "$APP_NAME")"
+echo "$(printf "$RMSG_RESTORE_DONE_DIR" "$APP_DIR")"
+echo "========================================="
+RESTORE_EOF
+
+    inject_lang_into_remote "$TMPSCRIPT"
+
+    SAFE_APP=$(sed_escape "$APP_NAME")
+    SAFE_USER=$(sed_escape "$USERNAME")
+    if [ "$OS" = "mac" ]; then
+        sed -i '' "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
+        sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
+    else
+        sed -i "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
+        sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
+    fi
+
+    REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
+    scp -i "$SSH_KEY" "$TMPSCRIPT" "${USERNAME}@${VPS_IP}:${REMOTE_TMP}"
+    rm -f "$TMPSCRIPT"
+
+    if [ -t 0 ]; then
+        SSH_TTY_FLAG="-t"
+    else
+        SSH_TTY_FLAG=""
+    fi
+
+    ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${USERNAME}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
+
+    echo ""
+    echo -e "${BOLD}$MSG_BACKUP_RESTORE_DONE${NC}"
+    echo ""
+    exit 0
+fi
+
+# =========================================
+# MODE SAUVEGARDE
+# =========================================
+
+TMPSCRIPT=$(mktemp)
+_CLEANUP_FILES+=("$TMPSCRIPT")
+cat > "$TMPSCRIPT" << 'BACKUP_EOF'
+#!/bin/bash
+set -euo pipefail
+
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+APP_NAME="__APP_NAME__"
+USERNAME="__USERNAME__"
+APPS_DIR="/home/$USERNAME/apps"
+BACKUP_DIR="/tmp/vps-backup-work"
+DATE=$(date +%Y-%m-%d)
+
+info()    { echo -e "${BLUE}[INFO] $1${NC}"; }
+success() { echo -e "${GREEN}[OK] $1${NC}"; }
+warn()    { echo -e "${YELLOW}[WARN] $1${NC}"; }
+err()     { echo -e "${RED}[ERR] $1${NC}"; }
+
+backup_app() {
+    local APP="$1"
+    local APP_PATH="$APPS_DIR/$APP"
+    local WORK="/tmp/vps-backup-$APP"
+
+    echo ""
+    echo -e "${BOLD}$(printf "$RMSG_BACKUP_APP_START" "$APP")${NC}"
+
+    if [ ! -d "$APP_PATH" ]; then
+        warn "$(printf "$RMSG_BACKUP_ERR_APP_NOT_FOUND" "$APP_PATH")"
+        return
+    fi
+
+    rm -rf "$WORK"
+    mkdir -p "$WORK"
+
+    # Fichier .env
+    if [ -f "$APP_PATH/.env" ]; then
+        cp "$APP_PATH/.env" "$WORK/env"
+        success "$RMSG_BACKUP_ENV_SAVED"
+    fi
+
+    # Metadonnees
+    DOMAIN=""
+    PORT=""
+    COMMIT=""
+
+    if [ -f "$APP_PATH/.deploy-domain" ]; then
+        DOMAIN=$(cat "$APP_PATH/.deploy-domain")
+        cp "$APP_PATH/.deploy-domain" "$WORK/deploy-domain"
+    fi
+    if [ -f "$APP_PATH/.deploy-port" ]; then
+        PORT=$(cat "$APP_PATH/.deploy-port")
+        cp "$APP_PATH/.deploy-port" "$WORK/deploy-port"
+    fi
+    if [ -d "$APP_PATH/.git" ]; then
+        COMMIT=$(cd "$APP_PATH" && git rev-parse HEAD 2>/dev/null || echo "")
+    fi
+
+    # Metadonnees JSON (printf pour eviter l'expansion de commandes)
+    printf '{\n    "app": "%s",\n    "date": "%s",\n    "domain": "%s",\n    "port": "%s",\n    "commit": "%s"\n}\n' \
+        "$APP" "$DATE" "$DOMAIN" "$PORT" "$COMMIT" > "$WORK/metadata.json"
+    success "$RMSG_BACKUP_METADATA_SAVED"
+
+    # Caddyfile
+    if [ -f /etc/caddy/Caddyfile ]; then
+        cp /etc/caddy/Caddyfile "$WORK/Caddyfile"
+        success "$RMSG_BACKUP_CADDYFILE_SAVED"
+    fi
+
+    # Dump base de donnees
+    COMPOSE_FILE=""
+    for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+        if [ -f "$APP_PATH/$f" ]; then
+            COMPOSE_FILE="$f"
+            break
+        fi
+    done
+
+    if [ -n "$COMPOSE_FILE" ]; then
+        SERVICES=$(cd "$APP_PATH" && docker compose ps --format '{{.Service}}:{{.Image}}' 2>/dev/null || true)
+
+        while IFS= read -r service_info; do
+            [ -z "$service_info" ] && continue
+            SERVICE_NAME=$(echo "$service_info" | cut -d: -f1)
+            SERVICE_IMAGE=$(echo "$service_info" | cut -d: -f2-)
+
+            # PostgreSQL
+            if echo "$SERVICE_IMAGE" | grep -qi "postgres"; then
+                info "$(printf "$RMSG_BACKUP_DB_DETECTED" "PostgreSQL" "$SERVICE_NAME")"
+                DB_USER=$(cd "$APP_PATH" && docker compose exec -T "$SERVICE_NAME" printenv POSTGRES_USER 2>/dev/null || echo "postgres")
+                DB_NAME=$(cd "$APP_PATH" && docker compose exec -T "$SERVICE_NAME" printenv POSTGRES_DB 2>/dev/null || echo "")
+                if [ -z "$DB_NAME" ]; then
+                    docker compose -f "$APP_PATH/$COMPOSE_FILE" exec -T "$SERVICE_NAME" pg_dumpall -U "$DB_USER" 2>/dev/null | gzip > "$WORK/db-postgres-${SERVICE_NAME}.sql.gz" || true
+                else
+                    docker compose -f "$APP_PATH/$COMPOSE_FILE" exec -T "$SERVICE_NAME" pg_dump -U "$DB_USER" "$DB_NAME" 2>/dev/null | gzip > "$WORK/db-postgres-${SERVICE_NAME}.sql.gz" || true
+                fi
+                if [ -s "$WORK/db-postgres-${SERVICE_NAME}.sql.gz" ]; then
+                    success "$(printf "$RMSG_BACKUP_DB_DUMPED" "PostgreSQL" "$SERVICE_NAME")"
+                else
+                    rm -f "$WORK/db-postgres-${SERVICE_NAME}.sql.gz"
+                    warn "$(printf "$RMSG_BACKUP_DB_DUMP_FAILED" "PostgreSQL" "$SERVICE_NAME")"
+                fi
+            fi
+
+            # MySQL / MariaDB
+            if echo "$SERVICE_IMAGE" | grep -qiE "mysql|mariadb"; then
+                info "$(printf "$RMSG_BACKUP_DB_DETECTED" "MySQL" "$SERVICE_NAME")"
+                DB_PASS=$(cd "$APP_PATH" && docker compose exec -T "$SERVICE_NAME" printenv MYSQL_ROOT_PASSWORD 2>/dev/null || echo "")
+                if [ -n "$DB_PASS" ]; then
+                    docker compose -f "$APP_PATH/$COMPOSE_FILE" exec -T "$SERVICE_NAME" mysqldump --all-databases -uroot -p"$DB_PASS" 2>/dev/null | gzip > "$WORK/db-mysql-${SERVICE_NAME}.sql.gz" || true
+                else
+                    docker compose -f "$APP_PATH/$COMPOSE_FILE" exec -T "$SERVICE_NAME" mysqldump --all-databases -uroot 2>/dev/null | gzip > "$WORK/db-mysql-${SERVICE_NAME}.sql.gz" || true
+                fi
+                if [ -s "$WORK/db-mysql-${SERVICE_NAME}.sql.gz" ]; then
+                    success "$(printf "$RMSG_BACKUP_DB_DUMPED" "MySQL" "$SERVICE_NAME")"
+                else
+                    rm -f "$WORK/db-mysql-${SERVICE_NAME}.sql.gz"
+                    warn "$(printf "$RMSG_BACKUP_DB_DUMP_FAILED" "MySQL" "$SERVICE_NAME")"
+                fi
+            fi
+
+            # MongoDB
+            if echo "$SERVICE_IMAGE" | grep -qi "mongo"; then
+                info "$(printf "$RMSG_BACKUP_DB_DETECTED" "MongoDB" "$SERVICE_NAME")"
+                docker compose -f "$APP_PATH/$COMPOSE_FILE" exec -T "$SERVICE_NAME" mongodump --archive 2>/dev/null | gzip > "$WORK/db-mongo-${SERVICE_NAME}.archive.gz" || true
+                if [ -s "$WORK/db-mongo-${SERVICE_NAME}.archive.gz" ]; then
+                    success "$(printf "$RMSG_BACKUP_DB_DUMPED" "MongoDB" "$SERVICE_NAME")"
+                else
+                    rm -f "$WORK/db-mongo-${SERVICE_NAME}.archive.gz"
+                    warn "$(printf "$RMSG_BACKUP_DB_DUMP_FAILED" "MongoDB" "$SERVICE_NAME")"
+                fi
+            fi
+        done <<< "$SERVICES"
+
+        # Volumes Docker (fallback / complement)
+        VOLUMES=$(cd "$APP_PATH" && docker compose config --volumes 2>/dev/null || true)
+        PROJECT_NAME=$(cd "$APP_PATH" && docker compose config --format json 2>/dev/null | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4 || echo "$APP")
+
+        if [ -n "$VOLUMES" ]; then
+            while IFS= read -r vol; do
+                [ -z "$vol" ] && continue
+                FULL_VOL="${PROJECT_NAME}_${vol}"
+                # Verifier que le volume existe
+                if docker volume inspect "$FULL_VOL" &>/dev/null; then
+                    info "$(printf "$RMSG_BACKUP_VOLUME_SAVING" "$FULL_VOL")"
+                    docker run --rm -v "$FULL_VOL":/data -v "$WORK":/backup alpine tar czf "/backup/volume-${FULL_VOL}.tar.gz" /data 2>/dev/null
+                    success "$(printf "$RMSG_BACKUP_VOLUME_SAVED" "$FULL_VOL")"
+                elif docker volume inspect "$vol" &>/dev/null; then
+                    info "$(printf "$RMSG_BACKUP_VOLUME_SAVING" "$vol")"
+                    docker run --rm -v "$vol":/data -v "$WORK":/backup alpine tar czf "/backup/volume-${vol}.tar.gz" /data 2>/dev/null
+                    success "$(printf "$RMSG_BACKUP_VOLUME_SAVED" "$vol")"
+                fi
+            done <<< "$VOLUMES"
+        fi
+    fi
+
+    # Creer l'archive finale
+    ARCHIVE_NAME="vps-backup-${DATE}-${APP}.tar.gz"
+    tar czf "/tmp/$ARCHIVE_NAME" -C "$WORK" .
+    rm -rf "$WORK"
+
+    success "$(printf "$RMSG_BACKUP_ARCHIVE_CREATED" "$ARCHIVE_NAME")"
+    echo "$ARCHIVE_NAME" >> /tmp/vps-backup-files.txt
+
+    # Upload vers S3 si rclone est configure et mode cloud/both
+    BUCKET_NAME="__S3_BUCKET__"
+    if [ "$SAVE_MODE" = "cloud" ] || [ "$SAVE_MODE" = "both" ]; then
+        if [ -n "$BUCKET_NAME" ]; then
+            if command -v rclone &>/dev/null && [ -f "$HOME/.config/rclone/rclone.conf" ]; then
+                info "$(printf "$RMSG_BACKUP_S3_UPLOADING" "$ARCHIVE_NAME")"
+                if rclone copy "/tmp/$ARCHIVE_NAME" "s3backup:$BUCKET_NAME/"; then
+                    success "$(printf "$RMSG_BACKUP_S3_UPLOADED" "$ARCHIVE_NAME")"
+                else
+                    warn "$(printf "$RMSG_BACKUP_S3_UPLOAD_FAILED" "$ARCHIVE_NAME")"
+                fi
+            else
+                warn "$RMSG_BACKUP_S3_RCLONE_MISSING"
+            fi
+        fi
+    fi
+}
+
+# Mode de sauvegarde (injecte par le script local)
+SAVE_MODE="__SAVE_MODE__"
+
+# Nettoyage
+rm -f /tmp/vps-backup-files.txt
+
+echo ""
+echo "========================================="
+echo -e "  ${BOLD}VPS BACKUP${NC}"
+echo "========================================="
+
+if [ -n "$APP_NAME" ]; then
+    backup_app "$APP_NAME"
+else
+    # Sauvegarder toutes les apps
+    for APP_PATH in "$APPS_DIR"/*/; do
+        [ -d "$APP_PATH" ] || continue
+        APP=$(basename "$APP_PATH")
+        backup_app "$APP"
+    done
+fi
+
+if [ ! -f /tmp/vps-backup-files.txt ]; then
+    echo ""
+    warn "$RMSG_BACKUP_WARN_NOTHING"
+    exit 0
+fi
+
+# Rotation S3 (supprimer les vieux backups)
+if [ "$SAVE_MODE" = "cloud" ] || [ "$SAVE_MODE" = "both" ]; then
+    BUCKET_NAME="__S3_BUCKET__"
+    RETENTION_DAYS="__RETENTION_DAYS__"
+    if [ -n "$BUCKET_NAME" ] && [ -n "$RETENTION_DAYS" ] && [ "$RETENTION_DAYS" -gt 0 ] 2>/dev/null; then
+        if command -v rclone &>/dev/null && [ -f "$HOME/.config/rclone/rclone.conf" ]; then
+            rclone delete "s3backup:$BUCKET_NAME/" --min-age "${RETENTION_DAYS}d"
+            success "$(printf "$RMSG_BACKUP_S3_ROTATION" "$RETENTION_DAYS")"
+        else
+            warn "$RMSG_BACKUP_S3_RCLONE_MISSING"
+        fi
+    fi
+fi
+
+# Rendre les archives lisibles par l'utilisateur (pour scp)
+while IFS= read -r f; do
+    chown "$USERNAME:$USERNAME" "/tmp/$f" 2>/dev/null || true
+done < /tmp/vps-backup-files.txt
+chown "$USERNAME:$USERNAME" /tmp/vps-backup-files.txt 2>/dev/null || true
+
+echo ""
+echo "========================================="
+echo -e "  ${GREEN}$RMSG_BACKUP_DONE${NC}"
+echo "========================================="
+echo ""
+echo "$RMSG_BACKUP_FILES_CREATED"
+while IFS= read -r f; do
+    echo "    - $f"
+done < /tmp/vps-backup-files.txt
+echo ""
+echo "========================================="
+BACKUP_EOF
+
+inject_lang_into_remote "$TMPSCRIPT"
+
+# =========================================
+# REMPLACEMENT DES PLACEHOLDERS
+# =========================================
+
+SAFE_APP=$(sed_escape "$APP_NAME")
+SAFE_USER=$(sed_escape "$USERNAME")
+
+# Charger la config S3 si elle existe
+SSH_DIR="$HOME/.ssh"
+[ "$OS" = "windows" ] && SSH_DIR="$USERPROFILE/.ssh"
+S3_CONFIG="$SSH_DIR/.vpskit-s3"
+S3_BUCKET=""
+S3_RETENTION_DAYS="30"
+if [ -f "$S3_CONFIG" ]; then
+    S3_BUCKET=$(read_state_var "$S3_CONFIG" "S3_BUCKET")
+    S3_RETENTION_DAYS=$(read_state_var "$S3_CONFIG" "S3_RETENTION_DAYS")
+    [ -z "$S3_RETENTION_DAYS" ] && S3_RETENTION_DAYS="30"
+fi
+SAFE_BUCKET=$(sed_escape "$S3_BUCKET")
+SAFE_RETENTION=$(sed_escape "$S3_RETENTION_DAYS")
+SAFE_SAVE_MODE=$(sed_escape "$SAVE_MODE")
+
+if [ "$OS" = "mac" ]; then
+    sed -i '' "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
+    sed -i '' "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
+    sed -i '' "s|__S3_BUCKET__|$SAFE_BUCKET|g" "$TMPSCRIPT"
+    sed -i '' "s|__RETENTION_DAYS__|$SAFE_RETENTION|g" "$TMPSCRIPT"
+    sed -i '' "s|__SAVE_MODE__|$SAFE_SAVE_MODE|g" "$TMPSCRIPT"
+else
+    sed -i "s|__APP_NAME__|$SAFE_APP|g" "$TMPSCRIPT"
+    sed -i "s|__USERNAME__|$SAFE_USER|g" "$TMPSCRIPT"
+    sed -i "s|__S3_BUCKET__|$SAFE_BUCKET|g" "$TMPSCRIPT"
+    sed -i "s|__RETENTION_DAYS__|$SAFE_RETENTION|g" "$TMPSCRIPT"
+    sed -i "s|__SAVE_MODE__|$SAFE_SAVE_MODE|g" "$TMPSCRIPT"
+fi
+
+# =========================================
+# ENVOI ET EXECUTION
+# =========================================
+
+info "$MSG_BACKUP_SENDING_SCRIPT"
+REMOTE_TMP=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "mktemp /tmp/vps-XXXXXXXXXX.sh")
+if ! scp -i "$SSH_KEY" "$TMPSCRIPT" "${USERNAME}@${VPS_IP}:${REMOTE_TMP}"; then
+    err "$MSG_BACKUP_ERR_SEND"
+    rm -f "$TMPSCRIPT"
+    exit 1
+fi
+rm -f "$TMPSCRIPT"
+
+# Detection TTY pour compatibilite CI/CD
+if [ -t 0 ]; then
+    SSH_TTY_FLAG="-t"
+else
+    SSH_TTY_FLAG=""
+fi
+
+ssh $SSH_TTY_FLAG -i "$SSH_KEY" "${USERNAME}@${VPS_IP}" "chmod 700 '${REMOTE_TMP}'; sudo bash '${REMOTE_TMP}'; rm -f '${REMOTE_TMP}'"
+
+# =========================================
+# RECUPERATION DES FICHIERS
+# =========================================
+
+# Lister les fichiers crees
+BACKUP_FILES=$(ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "cat /tmp/vps-backup-files.txt 2>/dev/null" || true)
+
+if [ -z "$BACKUP_FILES" ]; then
+    warn "$MSG_BACKUP_WARN_NOTHING_TO_RETRIEVE"
+    exit 0
+fi
+
+# Telecharger en local si mode local ou both
+if [ "$SAVE_MODE" = "local" ] || [ "$SAVE_MODE" = "both" ]; then
+    echo ""
+    info "$MSG_BACKUP_RETRIEVING"
+    mkdir -p "$DEST_DIR"
+
+    while IFS= read -r BACKUP_FILE; do
+        [ -z "$BACKUP_FILE" ] && continue
+        info "$(printf "$MSG_BACKUP_DOWNLOADING" "$BACKUP_FILE")"
+        scp -i "$SSH_KEY" "${USERNAME}@${VPS_IP}:/tmp/${BACKUP_FILE}" "${DEST_DIR}/${BACKUP_FILE}"
+        success "$(printf "$MSG_BACKUP_RETRIEVED" "${DEST_DIR}/${BACKUP_FILE}")"
+    done <<< "$BACKUP_FILES"
+fi
+
+# Nettoyage sur le serveur
+ssh -i "$SSH_KEY" -o BatchMode=yes "${USERNAME}@${VPS_IP}" "rm -f /tmp/vps-backup-*.tar.gz /tmp/vps-backup-files.txt" 2>/dev/null || true
+
+echo ""
+echo "========================================="
+echo -e "${BOLD}$MSG_BACKUP_DONE_TITLE${NC}"
+echo "========================================="
+echo ""
+if [ "$SAVE_MODE" = "local" ] || [ "$SAVE_MODE" = "both" ]; then
+    echo "$(printf "$MSG_BACKUP_DEST_DIR" "$DEST_DIR")"
+    echo ""
+    while IFS= read -r BACKUP_FILE; do
+        [ -z "$BACKUP_FILE" ] && continue
+        echo "    - $BACKUP_FILE"
+    done <<< "$BACKUP_FILES"
+    echo ""
+    echo "$MSG_BACKUP_HOW_TO_RESTORE"
+    echo ""
+    echo -e "    ${GREEN}bash backup.sh${NC}"
+fi
+if [ "$SAVE_MODE" = "cloud" ] || [ "$SAVE_MODE" = "both" ]; then
+    echo "$MSG_BACKUP_S3_DONE"
+fi
+echo ""
+echo "========================================="

@@ -15,6 +15,23 @@ bash <(curl -sL https://raw.githubusercontent.com/mariusdjen/vpskit/main/vpskit.
 
 That's it. The script guides you through everything.
 
+## Fork safety wrappers (vpskit-fran)
+
+This fork adds profile wrappers + preflight guardrails for safer usage:
+
+```bash
+# minimal secure baseline on a fresh VPS
+bash profiles/bootstrap-core.sh
+
+# deploy/update app workloads
+bash profiles/bootstrap-apps.sh
+
+# strict hardening path (explicit confirmation)
+bash profiles/bootstrap-hardened.sh
+```
+
+See `FORK_NOTES.md` for rationale and policy.
+
 ## Requirements
 
 | System | How to run |

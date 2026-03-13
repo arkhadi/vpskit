@@ -30,6 +30,23 @@ bash profiles/bootstrap-apps.sh
 bash profiles/bootstrap-hardened.sh
 ```
 
+### Unified runner (recommended)
+
+```bash
+# dry-run preflight only
+bash scripts/run-profile.sh --profile core --dry-run
+
+# run apps profile
+bash scripts/run-profile.sh --profile apps
+
+# allow touching existing ssh/firewall explicitly
+bash scripts/run-profile.sh --profile hardened \
+  --allow-ssh-changes --allow-firewall-changes
+
+# load config and use best-effort non-interactive mode
+bash scripts/run-profile.sh --profile core --config ./config.example.env --non-interactive
+```
+
 See `FORK_NOTES.md` for rationale and policy.
 
 ## Requirements
